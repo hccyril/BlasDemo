@@ -97,9 +97,9 @@ double dot_product(const double* x, const double* y, size_t n)
      *   - 使用 SIMD 指令（如 AVX2 的 vmulpd + vaddpd）进行向量化
      */
     return cblas_ddot(
-        static_cast<CBLAS_INT>(n),  // N
-        x, 1,                       // X, incX
-        y, 1                        // Y, incY
+        static_cast<int>(n),  // N
+        x, 1,                 // X, incX
+        y, 1                  // Y, incY
     );
 }
 
@@ -120,7 +120,7 @@ void axpy(double alpha, const double* x, double* y, size_t n)
      * OpenBLAS 的 daxpy kernel 通常可以达到内存带宽的理论峰值。
      */
     cblas_daxpy(
-        static_cast<CBLAS_INT>(n),  // N
+        static_cast<int>(n),  // N
         alpha,                      // alpha
         x, 1,                       // X, incX
         y, 1                        // Y, incY
@@ -139,7 +139,7 @@ void scal(double alpha, double* x, size_t n)
      *   incX  - x 的步长
      */
     cblas_dscal(
-        static_cast<CBLAS_INT>(n),  // N
+        static_cast<int>(n),  // N
         alpha,                      // alpha
         x, 1                        // X, incX
     );
@@ -156,7 +156,7 @@ double vector_norm(const double* x, size_t n)
      * 类似于 LAPACK 的 dlapy2 中的缩放策略。
      */
     return cblas_dnrm2(
-        static_cast<CBLAS_INT>(n),  // N
+        static_cast<int>(n),  // N
         x, 1                        // X, incX
     );
 }
@@ -169,7 +169,7 @@ double vector_asum(const double* x, size_t n)
      * L1 范数计算，在稀疏优化（LASSO）和压缩感知中有广泛应用。
      */
     return cblas_dasum(
-        static_cast<CBLAS_INT>(n),  // N
+        static_cast<int>(n),  // N
         x, 1                        // X, incX
     );
 }
@@ -209,10 +209,10 @@ void gemv(const double* A, const double* x, double* y,
     cblas_dgemv(
         CblasColMajor,                                  // 列优先存储
         CblasNoTrans,                                   // 不转置
-        static_cast<CBLAS_INT>(m),                      // M
-        static_cast<CBLAS_INT>(n),                      // N
+        static_cast<int>(m),                      // M
+        static_cast<int>(n),                      // N
         alpha,                                          // alpha
-        A, static_cast<CBLAS_INT>(lda),                 // A, lda
+        A, static_cast<int>(lda),                 // A, lda
         x, 1,                                           // X, incX
         beta,                                           // beta
         y, 1                                            // Y, incY
@@ -265,14 +265,14 @@ void gemm(const double* A, const double* B, double* C,
         CblasColMajor,                                  // 列优先
         CblasNoTrans,                                   // A 不转置
         CblasNoTrans,                                   // B 不转置
-        static_cast<CBLAS_INT>(m),                      // M
-        static_cast<CBLAS_INT>(n),                      // N
-        static_cast<CBLAS_INT>(k),                      // K
+        static_cast<int>(m),                      // M
+        static_cast<int>(n),                      // N
+        static_cast<int>(k),                      // K
         alpha,                                          // alpha
-        A, static_cast<CBLAS_INT>(lda),                 // A, lda
-        B, static_cast<CBLAS_INT>(ldb),                 // B, ldb
+        A, static_cast<int>(lda),                 // A, lda
+        B, static_cast<int>(ldb),                 // B, ldb
         beta,                                           // beta
-        C, static_cast<CBLAS_INT>(ldc)                  // C, ldc
+        C, static_cast<int>(ldc)                  // C, ldc
     );
 }
 
@@ -302,13 +302,13 @@ void symm(const double* A, const double* B, double* C,
         CblasColMajor,                                  // 列优先
         CblasLeft,                                      // A 在左侧
         upper ? CblasUpper : CblasLower,                // 上/下三角
-        static_cast<CBLAS_INT>(m),                      // M
-        static_cast<CBLAS_INT>(n),                      // N
+        static_cast<int>(m),                      // M
+        static_cast<int>(n),                      // N
         alpha,                                          // alpha
-        A, static_cast<CBLAS_INT>(lda),                 // A, lda
-        B, static_cast<CBLAS_INT>(ldb),                 // B, ldb
+        A, static_cast<int>(lda),                 // A, lda
+        B, static_cast<int>(ldb),                 // B, ldb
         beta,                                           // beta
-        C, static_cast<CBLAS_INT>(ldc)                  // C, ldc
+        C, static_cast<int>(ldc)                  // C, ldc
     );
 }
 
