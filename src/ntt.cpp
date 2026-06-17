@@ -78,6 +78,82 @@ uint32_t mod_inv(uint32_t a, uint32_t q)
     return mod_pow(a, q - 2, q);
 }
 
+uint32_t mod_sqrt(uint32_t a, uint32_t q)
+{
+    /**
+     * Tonelli-Shanks 算法：计算 sqrt(a) mod q
+     *
+     * 算法步骤：
+     *   1. 分解 q - 1 = Q * 2^S（提取 2 的幂次）
+     *   2. 找到一个模 q 的二次非剩余 z
+     *   3. 初始化：M = S, c = z^Q, t = a^Q, R = a^{(Q+1)/2}
+     *   4. 循环：找到最小的 i 使得 t^{2^i} = 1
+     *      - 若 i = 0，则 R 即为所求
+     *      - 否则更新 M, c, t, R 并继续
+     *
+     * 复杂度：O(log^2 q)
+     *
+     * 在 NTT 中的应用：
+     *   当 omega 是 n 次单位根（omega^n = 1）时，
+     *   需要计算 psi = sqrt(omega) 作为 2n 次单位根，
+     *   用于 negacyclic NTT 的预乘/后乘步骤。
+     */
+
+    if (a == 0) return 0;
+    if (q == 2) return a;
+
+    // 检查 a 是否为二次剩余（欧拉准则）
+    if (mod_pow(a, (q - 1) / 2, q) != 1) {
+        return 0;  // a 不是模 q 的二次剩余
+    }
+
+    // 分解 q - 1 = Q * 2^S
+    uint32_t Q = q - 1;
+    uint32_t S = 0;
+    while (Q % 2 == 0) {
+        Q /= 2;
+        S++;
+    }
+
+    // 特殊情况：S = 1（即 q ≡ 3 mod 4），可用简化公式
+    if (S == 1) {
+        return mod_pow(a, (q + 1) / 4, q);
+    }
+
+    // 找到二次非剩余 z
+    uint32_t z = 2;
+    while (mod_pow(z, (q - 1) / 2, q) != q - 1) {
+        z++;
+    }
+
+    uint32_t M = S;
+    uint32_t c = mod_pow(z, Q, q);
+    uint32_t t = mod_pow(a, Q, q);
+    uint32_t R = mod_pow(a, (Q + 1) / 2, q);
+
+    while (true) {
+        if (t == 1) return R;
+
+        // 找到最小的 i (0 < i < M) 使得 t^{2^i} ≡ 1 (mod q)
+        uint32_t i = 0;
+        uint32_t tmp = t;
+        do {
+            tmp = mod_mul(tmp, tmp, q);
+            i++;
+        } while (tmp != 1 && i < M);
+
+        // 更新参数
+        uint32_t b = c;
+        for (uint32_t j = 0; j < M - i - 1; ++j) {
+            b = mod_mul(b, b, q);
+        }
+        M = i;
+        c = mod_mul(b, b, q);
+        t = mod_mul(t, c, q);
+        R = mod_mul(R, b, q);
+    }
+}
+
 // ==========================================================================
 // NTTContext 模板实现
 // ==========================================================================
@@ -86,41 +162,64 @@ template <typename Params>
 NTTContext<Params>::NTTContext()
     : q_(Params::q)
     , n_(Params::n)
-    , omega_(Params::omega)
 {
     /**
-     * 构造函数：预计算所有旋转因子（Twiddle Factors）
+     * 构造函数：推导 negacyclic NTT 所需的全部参数
      *
-     * 对于正向 NTT（Cooley-Tukey 蝶形），需要：
-     *   twiddle[i] = omega^{bit_rev(i)} mod q
+     * 核心步骤：
+     *   1. 从模板参数 omega 推导 ψ（2n 次本原单位根）
+     *   2. 计算 ω_ntt = ψ^2（标准 NTT 的 n 次单位根）
+     *   3. 预计算旋转因子和逆旋转因子
      *
-     * 对于逆向 NTT（Gentleman-Sande 蝶形），需要：
-     *   inv_twiddle[i] = omega^{-bit_rev(i)} mod q
+     * 两种参数情况的处理：
      *
-     * 预计算策略：
-     *   先计算 omega^0, omega^1, ..., omega^{n-1}
-     *   然后按比特反转顺序存储
+     *   情况 A（Dilithium）：omega^n ≡ -1 (mod q)
+     *     omega 本身即为 2n 次单位根，直接令 ψ = omega
+     *     ω_ntt = omega^2（n 次单位根）
+     *
+     *   情况 B（Kyber）：omega^n ≡ 1 (mod q)
+     *     omega 是 n 次单位根，需要计算 ψ = sqrt(omega)
+     *     使用 Tonelli-Shanks 算法求模平方根
+     *     ω_ntt = omega（n 次单位根不变）
      */
 
-    // 计算 omega 的逆元（用于 INTT）
-    omega_inv_ = mod_inv(omega_, q_);
+    constexpr uint32_t omega = Params::omega;
 
     // 计算 n 的逆元（用于 INTT 的归一化）
     n_inv_ = mod_inv(n_, q_);
 
-    // 分配旋转因子数组
+    // 判断 omega 是 n 次还是 2n 次单位根
+    uint32_t omega_n = mod_pow(omega, n_, q_);
+
+    if (omega_n == q_ - 1) {
+        // 情况 A：omega^n = -1，omega 本身是 2n 次单位根（Dilithium）
+        psi_ = omega;
+        omega_ntt_ = mod_mul(omega, omega, q_);  // ω_ntt = ψ^2
+    } else {
+        // 情况 B：omega^n = 1，omega 是 n 次单位根，需计算 ψ = sqrt(omega)（Kyber）
+        psi_ = mod_sqrt(omega, q_);
+        assert(psi_ != 0 && "sqrt(omega) 不存在，参数有误");
+        // 验证 ψ^n ≡ -1 (mod q)
+        assert(mod_pow(psi_, n_, q_) == q_ - 1 && "ψ^n ≠ -1 (mod q)，参数有误");
+        omega_ntt_ = omega;  // ω_ntt 不变
+    }
+
+    // 计算 ψ 和 ω_ntt 的逆元
+    psi_inv_ = mod_inv(psi_, q_);
+    omega_ntt_inv_ = mod_inv(omega_ntt_, q_);
+
+    // 分配并预计算旋转因子
     twiddles_.resize(n_);
     inv_twiddles_.resize(n_);
 
-    // 计算 omega^i mod q 和 omega^{-i} mod q
-    uint32_t w_pow = 1;       // omega^0
-    uint32_t w_inv_pow = 1;   // omega^{-0}
+    uint32_t w_pow = 1;       // ω_ntt^0
+    uint32_t w_inv_pow = 1;   // ω_ntt^{-0}
 
     for (uint32_t i = 0; i < n_; ++i) {
         twiddles_[i] = w_pow;
         inv_twiddles_[i] = w_inv_pow;
-        w_pow = mod_mul(w_pow, omega_, q_);
-        w_inv_pow = mod_mul(w_inv_pow, omega_inv_, q_);
+        w_pow = mod_mul(w_pow, omega_ntt_, q_);
+        w_inv_pow = mod_mul(w_inv_pow, omega_ntt_inv_, q_);
     }
 }
 
@@ -183,30 +282,31 @@ template <typename Params>
 void NTTContext<Params>::forward(uint32_t* poly) const
 {
     /**
-     * 正向 NTT — Cooley-Tukey 蝶形算法（迭代版本）
+     * Negacyclic NTT 正向变换
      *
-     * 算法核心思想：分治
-     *   将长度为 n 的 DFT 分解为两个长度为 n/2 的 DFT，
-     *   递归分解直到长度为 1（即恒等变换）。
+     * 步骤：
+     *   1. 预乘 ψ^i（negacyclic twist）：poly[i] *= ψ^i mod q
+     *   2. 标准 NTT（Cooley-Tukey 蝶形）：比特反转 + 蝶形运算
      *
-     * 迭代实现从底向上构建：
-     *   第 s 轮（s = 1, 2, ..., log2(n)）：
-     *     步长 len = 2^s
-     *     对每个子块执行蝶形操作：
-     *       for j = 0 to len/2 - 1:
-     *         w = omega^{j * n / len}   （旋转因子）
-     *         t = w * poly[k + j + len/2] mod q
-     *         poly[k + j + len/2] = poly[k + j] - t mod q
-     *         poly[k + j]         = poly[k + j] + t mod q
+     * 预乘 ψ^i 的数学意义：
+     *   将 Z_q[x]/(x^n+1) 上的 negacyclic 卷积映射到
+     *   标准 NTT 可处理的 cyclic 卷积。
+     *   ψ 是 2n 次单位根（ψ^n = -1），确保了 x^n ≡ -1 的约减规则。
      *
-     * 蝶形示意图（单步）：
-     *   poly[k+j] ──────► poly[k+j] + t
-     *                     ⊕
-     *   poly[k+j+len/2] ─► t = w * poly[k+j+len/2]
-     *                     ⊗ w
+     * 蝶形操作（标准 CT）：
+     *   t = ω_ntt^{j*step} * poly[k + j + half] mod q
+     *   poly[k + j + half] = poly[k + j] - t mod q
+     *   poly[k + j]        = poly[k + j] + t mod q
      */
 
-    // 第一步：比特反转置换
+    // 第一步：预乘 ψ^i（negacyclic twist）
+    uint32_t psi_pow = 1;  // ψ^0 = 1
+    for (uint32_t i = 0; i < n_; ++i) {
+        poly[i] = mod_mul(poly[i], psi_pow, q_);
+        psi_pow = mod_mul(psi_pow, psi_, q_);
+    }
+
+    // 第二步：比特反转置换
     bit_reverse(poly);
 
     uint32_t log = log2n();
@@ -239,20 +339,17 @@ template <typename Params>
 void NTTContext<Params>::inverse(uint32_t* poly) const
 {
     /**
-     * 逆向 NTT — Gentleman-Sande 蝶形算法（迭代版本）
+     * Negacyclic NTT 逆向变换
      *
-     * 与正向 NTT 的区别：
-     *   1. 使用 omega^{-1} 作为旋转基（而非 omega）
-     *   2. 蝶形方向相反：从大到小（len = n, n/2, ..., 2）
-     *   3. 最后需要乘以 n^{-1} mod q 进行归一化
+     * 步骤：
+     *   1. 标准 INTT（Gentleman-Sande 蝶形）：逆蝶形 + 比特反转 + 归一化
+     *   2. 后乘 ψ^{-i}（撤销 negacyclic twist）：poly[i] *= ψ^{-i} mod q
      *
-     * Gentleman-Sande 蝶形（单步）：
+     * GS 蝶形（单步）：
      *   u = poly[k + j]
      *   v = poly[k + j + half]
      *   poly[k + j]        = u + v mod q
-     *   poly[k + j + half] = w * (u - v) mod q
-     *
-     * 注意：GS 蝶形先做加减法，再乘旋转因子（与 CT 蝶形相反）
+     *   poly[k + j + half] = ω_ntt^{-j*step} * (u - v) mod q
      */
 
     uint32_t log = log2n();
@@ -284,6 +381,14 @@ void NTTContext<Params>::inverse(uint32_t* poly) const
     // 归一化：每个系数乘以 n^{-1} mod q
     for (uint32_t i = 0; i < n_; ++i) {
         poly[i] = mod_mul(poly[i], n_inv_, q_);
+    }
+
+    // 后乘 ψ^{-i}（撤销 negacyclic twist）
+    // 正变换预乘了 ψ^i，逆变换需要乘以 ψ^{-i} 来恢复原始系数
+    uint32_t psi_inv_pow = 1;  // ψ^{-0} = 1
+    for (uint32_t i = 0; i < n_; ++i) {
+        poly[i] = mod_mul(poly[i], psi_inv_pow, q_);
+        psi_inv_pow = mod_mul(psi_inv_pow, psi_inv_, q_);
     }
 }
 
@@ -359,13 +464,14 @@ template <typename Params>
 bool verify_params()
 {
     /**
-     * 验证 NTT 参数的正确性
+     * 验证 NTT 参数的正确性（Negacyclic NTT 版本）
      *
      * 检查项：
-     *   1. n 是否为 2 的幂（NTT 要求）
-     *   2. q 是否为素数（简单试除法，适用于小素数）
-     *   3. omega^n ≡ 1 (mod q)（本原单位根的基本条件）
-     *   4. omega^{n/2} ≡ -1 (mod q)（negacyclic 条件，确保在 x^n+1 上正确）
+     *   1. n 是否为 2 的幂
+     *   2. q 是否为素数（简单试除法）
+     *   3. 从 omega 推导 ψ（2n 次本原单位根），验证 ψ^n ≡ -1 (mod q)
+     *      - omega^n ≡ -1: ψ = omega（Dilithium 情况）
+     *      - omega^n ≡ 1:  ψ = sqrt(omega)（Kyber 情况）
      */
     constexpr uint32_t q = Params::q;
     constexpr uint32_t n = Params::n;
@@ -389,18 +495,31 @@ bool verify_params()
         }
     }
 
-    // 检查 omega^n ≡ 1 (mod q)
+    // 推导 ψ 并验证 ψ^n ≡ -1 (mod q)
+    uint32_t psi;
     uint32_t omega_n = mod_pow(omega, n, q);
-    if (omega_n != 1) {
-        std::cerr << "错误: omega^n = " << omega_n << " != 1 (mod " << q << ")\n";
+
+    if (omega_n == q - 1) {
+        // omega 本身是 2n 次单位根（Dilithium 情况）
+        psi = omega;
+    } else if (omega_n == 1) {
+        // omega 是 n 次单位根，需计算 ψ = sqrt(omega)（Kyber 情况）
+        psi = mod_sqrt(omega, q);
+        if (psi == 0) {
+            std::cerr << "错误: sqrt(" << omega << ") 在 Z_" << q << " 中不存在\n";
+            return false;
+        }
+    } else {
+        std::cerr << "错误: omega^n = " << omega_n
+                  << "，既不是 1 也不是 -1 (mod " << q << ")\n";
         return false;
     }
 
-    // 检查 omega^{n/2} ≡ -1 ≡ q-1 (mod q)（negacyclic 条件）
-    uint32_t omega_half = mod_pow(omega, n / 2, q);
-    if (omega_half != q - 1) {
-        std::cerr << "错误: omega^{n/2} = " << omega_half
-                  << " != " << (q - 1) << " (mod " << q << ")\n";
+    // 最终验证：ψ^n ≡ -1 (mod q)
+    uint32_t psi_n = mod_pow(psi, n, q);
+    if (psi_n != q - 1) {
+        std::cerr << "错误: ψ^n = " << psi_n << " != " << (q - 1)
+                  << " (mod " << q << ")\n";
         return false;
     }
 

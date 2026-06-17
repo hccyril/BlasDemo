@@ -5,18 +5,25 @@
  * NTT 是离散傅里叶变换（DFT）在有限域 Z_q 上的类比。
  * 它是现代格密码方案（如 Kyber/ML-KEM、Dilithium/ML-DSA）的核心算子。
  *
- * 数学定义：
+ * 数学定义（Negacyclic NTT）：
  *   给定多项式 a(x) = sum_{i=0}^{n-1} a_i * x^i ∈ Z_q[x] / (x^n + 1)
- *   NTT 正变换: A_k = sum_{i=0}^{n-1} a_i * omega^{ik} mod q,  k = 0,...,n-1
- *   NTT 逆变换: a_i = n^{-1} * sum_{k=0}^{n-1} A_k * omega^{-ik} mod q
  *
- *   其中 omega 是 Z_q 中的 n 次本原单位根，满足：
- *     omega^n ≡ 1 (mod q)
- *     omega^{n/2} ≡ -1 (mod q)  （用于 negacyclic NTT）
+ *   设 ψ 为 Z_q 中的 2n 次本原单位根（ψ^n ≡ -1 (mod q)），
+ *   ω = ψ^2 为 n 次本原单位根（ω^n ≡ 1 (mod q)）。
+ *
+ *   Negacyclic NTT 正变换:
+ *     A_k = sum_{i=0}^{n-1} (a_i * ψ^i) * ω^{ik} mod q
+ *         = NTT_standard(a_i * ψ^i)
+ *
+ *   Negacyclic NTT 逆变换:
+ *     a_i = ψ^{-i} * INTT_standard(A_k)_i mod q
+ *
+ *   性质：negacyclic NTT 域中的逐点相乘对应于
+ *   Z_q[x]/(x^n + 1) 上的 negacyclic 卷积（多项式乘法）。
  *
  * 本实现支持两组参数：
- *   1. Kyber 参数: q = 3329, n = 256, omega = 17
- *   2. 通用参数:   用户可自定义 q, n, omega
+ *   1. Kyber 参数:     q = 3329,     n = 256, omega = 17   (n 次单位根，需计算 ψ = √17)
+ *   2. Dilithium 参数: q = 8380417,  n = 256, omega = 1753 (2n 次单位根，ψ = omega)
  *
  * @note 本实现侧重教学演示，生产环境请使用高度优化的 NTT 库
  *       （如 libntt, PALISADE/OpenFHE 内置 NTT 等）
@@ -152,6 +159,21 @@ uint32_t mod_pow(uint32_t base, uint32_t exp, uint32_t q);
  */
 uint32_t mod_inv(uint32_t a, uint32_t q);
 
+/**
+ * @brief 模平方根: sqrt(a) mod q（Tonelli-Shanks 算法）
+ *
+ * 计算满足 x^2 ≡ a (mod q) 的 x。
+ * 用于从 n 次单位根 omega 计算 2n 次单位根 psi = sqrt(omega)。
+ *
+ * 当 q ≡ 3 (mod 4) 时可用简化公式 x = a^{(q+1)/4} mod q。
+ * 本实现使用通用的 Tonelli-Shanks 算法，适用于所有奇素数 q。
+ *
+ * @param a  输入值
+ * @param q  奇素数模数
+ * @return   sqrt(a) mod q，如果不存在则返回 0
+ */
+uint32_t mod_sqrt(uint32_t a, uint32_t q);
+
 // ==========================================================================
 // NTT 核心接口
 // ==========================================================================
@@ -168,40 +190,41 @@ template <typename Params>
 class NTTContext {
 public:
     /**
-     * @brief 构造 NTT 上下文，预计算旋转因子
+     * @brief 构造 NTT 上下文，预计算 negacyclic NTT 所需的全部参数
      *
      * 预计算内容：
-     *   - 正变换旋转因子: omega^{bit_rev(i)} mod q, i = 0,...,n-1
-     *   - 逆变换旋转因子: omega^{-bit_rev(i)} mod q
-     *   - n 的模逆元（用于逆变换归一化）
+     *   1. ψ (psi): 2n 次本原单位根（从 omega 推导）
+     *      - 若 omega^n ≡ -1 (mod q): ψ = omega（Dilithium 情况）
+     *      - 若 omega^n ≡ 1 (mod q):  ψ = sqrt(omega)（Kyber 情况，需 Tonelli-Shanks）
+     *   2. ω_ntt = ψ^2: 标准 NTT 使用的 n 次单位根
+     *   3. 正变换旋转因子: ω_ntt^i mod q
+     *   4. 逆变换旋转因子: ω_ntt^{-i} mod q
+     *   5. ψ^{-1} 和 n^{-1}（用于逆变换的归一化）
      */
     NTTContext();
 
     /**
-     * @brief 正变换 NTT（Cooley-Tukey 蝶形，迭代实现）
+     * @brief Negacyclic NTT 正变换（Cooley-Tukey 蝶形 + 预乘 ψ）
      *
-     * 将多项式从系数表示转换为 NTT 域（点值表示）。
-     * 在 NTT 域中，多项式乘法变为逐点相乘，复杂度从 O(n^2) 降至 O(n log n)。
+     * 将多项式从系数表示转换为 negacyclic NTT 域。
+     * 在 NTT 域中，逐点相乘对应 Z_q[x]/(x^n+1) 上的多项式乘法。
      *
-     * 算法流程（以 n=8 为例）：
-     *   第 1 轮: 步长 = 4, 蝶形对 (0,4), (1,5), (2,6), (3,7)
-     *   第 2 轮: 步长 = 2, 蝶形对 (0,2), (1,3), (4,6), (5,7)
-     *   第 3 轮: 步长 = 1, 蝶形对 (0,1), (2,3), (4,5), (6,7)
-     *
-     * 蝶形操作：
-     *   t = omega^k * a[j + step] mod q
-     *   a[j + step] = a[j] - t mod q
-     *   a[j]        = a[j] + t mod q
+     * 步骤：
+     *   1. 预乘: poly[i] = poly[i] * ψ^i mod q（negacyclic twist）
+     *   2. 标准 NTT: 比特反转 + Cooley-Tukey 蝶形（使用 ω_ntt = ψ^2）
      *
      * @param poly  输入/输出多项式系数（原地变换），长度 = n
      */
     void forward(uint32_t* poly) const;
 
     /**
-     * @brief 逆变换 INTT（Gentleman-Sande 蝶形，迭代实现）
+     * @brief Negacyclic NTT 逆变换（Gentleman-Sande 蝶形 + 后乘 ψ^{-1}）
      *
-     * 将 NTT 域的点值表示恢复为系数表示。
-     * 蝶形方向与正变换相反，最后乘以 n^{-1} mod q 进行归一化。
+     * 将 negacyclic NTT 域恢复为系数表示。
+     *
+     * 步骤：
+     *   1. 标准 INTT: Gentleman-Sande 蝶形 + 比特反转 + 归一化（使用 ω_ntt^{-1}）
+     *   2. 后乘: poly[i] = poly[i] * ψ^{-i} mod q（撤销 negacyclic twist）
      *
      * @param poly  输入/输出多项式系数（原地变换），长度 = n
      */
@@ -251,11 +274,13 @@ public:
 private:
     uint32_t q_;                        // 模数
     uint32_t n_;                        // 多项式维度
-    uint32_t omega_;                    // 本原单位根
-    uint32_t omega_inv_;                // omega 的模逆元
-    uint32_t n_inv_;                    // n 的模逆元
-    std::vector<uint32_t> twiddles_;    // 正变换旋转因子
-    std::vector<uint32_t> inv_twiddles_;// 逆变换旋转因子
+    uint32_t psi_;                      // 2n 次本原单位根（ψ^n ≡ -1 mod q）
+    uint32_t psi_inv_;                  // ψ 的模逆元（用于 INTT 后乘）
+    uint32_t omega_ntt_;                // NTT 使用的 n 次单位根（= ψ^2）
+    uint32_t omega_ntt_inv_;            // ω_ntt 的模逆元
+    uint32_t n_inv_;                    // n 的模逆元（用于 INTT 归一化）
+    std::vector<uint32_t> twiddles_;    // 正变换旋转因子: ω_ntt^i
+    std::vector<uint32_t> inv_twiddles_;// 逆变换旋转因子: ω_ntt^{-i}
 
     /**
      * @brief 比特反转置换（Bit-Reversal Permutation）
@@ -287,9 +312,10 @@ private:
  *
  * 检查：
  *   1. q 是否为素数（简单的试除法）
- *   2. omega^n ≡ 1 (mod q)
- *   3. omega^{n/2} ≡ -1 (mod q)（确保是 negacyclic NTT）
- *   4. n 是否为 2 的幂
+ *   2. n 是否为 2 的幂
+ *   3. 从 omega 推导 ψ（2n 次本原单位根），验证 ψ^n ≡ -1 (mod q)
+ *      - 若 omega^n ≡ -1: ψ = omega（omega 本身即为 2n 次单位根）
+ *      - 若 omega^n ≡ 1:  ψ = sqrt(omega)（需通过 Tonelli-Shanks 计算）
  *
  * @tparam Params  参数结构体
  * @return true 表示参数正确，false 表示参数有误
