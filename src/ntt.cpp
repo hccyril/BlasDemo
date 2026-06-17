@@ -164,23 +164,21 @@ NTTContext<Params>::NTTContext()
     , n_(Params::n)
 {
     /**
-     * 构造函数：推导 negacyclic NTT 所需的全部参数
+     * 构造函数：推导 NTT 所需的全部参数
      *
-     * 核心步骤：
-     *   1. 从模板参数 omega 推导 ψ（2n 次本原单位根）
-     *   2. 计算 ω_ntt = ψ^2（标准 NTT 的 n 次单位根）
-     *   3. 预计算旋转因子和逆旋转因子
-     *
-     * 两种参数情况的处理：
+     * 两种情况：
      *
      *   情况 A（Dilithium）：omega^n ≡ -1 (mod q)
-     *     omega 本身即为 2n 次单位根，直接令 ψ = omega
-     *     ω_ntt = omega^2（n 次单位根）
+     *     omega 是 2n 次本原单位根，ψ = omega
+     *     可使用预乘/后乘方法的快速 negacyclic NTT
      *
      *   情况 B（Kyber）：omega^n ≡ 1 (mod q)
-     *     omega 是 n 次单位根，需要计算 ψ = sqrt(omega)
-     *     使用 Tonelli-Shanks 算法求模平方根
-     *     ω_ntt = omega（n 次单位根不变）
+     *     omega 是 n 次单位根。需要 ψ 使得 ψ^n ≡ -1 (mod q)。
+     *     但 q-1 = 3328 = 13×2^8，而 2n = 512 = 2^9 不整除 q-1，
+     *     因此 Z_q* 中不存在阶为 2n 的元素（即 ψ 不存在）。
+     *     此时 poly_mul 回退到 O(n²) 朴素乘法。
+     *     （Kyber 实际使用"不完全分裂 NTT"，需要合并旋转因子方法，
+     *      本教学演示暂不实现，后续可添加。）
      */
 
     constexpr uint32_t omega = Params::omega;
@@ -188,20 +186,24 @@ NTTContext<Params>::NTTContext()
     // 计算 n 的逆元（用于 INTT 的归一化）
     n_inv_ = mod_inv(n_, q_);
 
-    // 判断 omega 是 n 次还是 2n 次单位根
     uint32_t omega_n = mod_pow(omega, n_, q_);
 
     if (omega_n == q_ - 1) {
         // 情况 A：omega^n = -1，omega 本身是 2n 次单位根（Dilithium）
         psi_ = omega;
         omega_ntt_ = mod_mul(omega, omega, q_);  // ω_ntt = ψ^2
+        use_fast_ntt_ = true;
+    } else if (omega_n == 1) {
+        // 情况 B：omega^n = 1（Kyber）
+        // Z_q* 中不存在 2n 次单位根 ψ（ψ^n = -1），
+        // 无法使用预乘/后乘方法的 negacyclic NTT
+        psi_ = omega;                              // 占位值
+        omega_ntt_ = mod_mul(omega, omega, q_);    // 占位值
+        use_fast_ntt_ = false;
     } else {
-        // 情况 B：omega^n = 1，omega 是 n 次单位根，需计算 ψ = sqrt(omega)（Kyber）
-        psi_ = mod_sqrt(omega, q_);
-        assert(psi_ != 0 && "sqrt(omega) 不存在，参数有误");
-        // 验证 ψ^n ≡ -1 (mod q)
-        assert(mod_pow(psi_, n_, q_) == q_ - 1 && "ψ^n ≠ -1 (mod q)，参数有误");
-        omega_ntt_ = omega;  // ω_ntt 不变
+        assert(false && "omega^n 既不是 1 也不是 -1 (mod q)，参数有误");
+        psi_ = omega_ntt_ = 0;
+        use_fast_ntt_ = false;
     }
 
     // 计算 ψ 和 ω_ntt 的逆元
@@ -282,28 +284,25 @@ template <typename Params>
 void NTTContext<Params>::forward(uint32_t* poly) const
 {
     /**
-     * Negacyclic NTT 正向变换
+     * NTT 正向变换
      *
-     * 步骤：
-     *   1. 预乘 ψ^i（negacyclic twist）：poly[i] *= ψ^i mod q
-     *   2. 标准 NTT（Cooley-Tukey 蝶形）：比特反转 + 蝶形运算
+     * 当 use_fast_ntt_ = true 时执行完整 negacyclic NTT：
+     *   1. 预乘 ψ^i（negacyclic twist）
+     *   2. 标准 NTT（Cooley-Tukey 蝶形）
      *
-     * 预乘 ψ^i 的数学意义：
-     *   将 Z_q[x]/(x^n+1) 上的 negacyclic 卷积映射到
-     *   标准 NTT 可处理的 cyclic 卷积。
-     *   ψ 是 2n 次单位根（ψ^n = -1），确保了 x^n ≡ -1 的约减规则。
-     *
-     * 蝶形操作（标准 CT）：
-     *   t = ω_ntt^{j*step} * poly[k + j + half] mod q
-     *   poly[k + j + half] = poly[k + j] - t mod q
-     *   poly[k + j]        = poly[k + j] + t mod q
+     * 当 use_fast_ntt_ = false 时仅执行标准 NTT（无预乘），
+     * 用于 INTT(NTT(a)) = a 的正确性验证。
      */
 
     // 第一步：预乘 ψ^i（negacyclic twist）
-    uint32_t psi_pow = 1;  // ψ^0 = 1
-    for (uint32_t i = 0; i < n_; ++i) {
-        poly[i] = mod_mul(poly[i], psi_pow, q_);
-        psi_pow = mod_mul(psi_pow, psi_, q_);
+    // 仅在 ψ 存在时执行（即 use_fast_ntt_ = true，如 Dilithium）
+    // 对于 Kyber，ψ 不存在于 Z_q 中，跳过此步骤
+    if (use_fast_ntt_) {
+        uint32_t psi_pow = 1;  // ψ^0 = 1
+        for (uint32_t i = 0; i < n_; ++i) {
+            poly[i] = mod_mul(poly[i], psi_pow, q_);
+            psi_pow = mod_mul(psi_pow, psi_, q_);
+        }
     }
 
     // 第二步：比特反转置换
@@ -339,17 +338,13 @@ template <typename Params>
 void NTTContext<Params>::inverse(uint32_t* poly) const
 {
     /**
-     * Negacyclic NTT 逆向变换
+     * NTT 逆向变换
      *
-     * 步骤：
-     *   1. 标准 INTT（Gentleman-Sande 蝶形）：逆蝶形 + 比特反转 + 归一化
-     *   2. 后乘 ψ^{-i}（撤销 negacyclic twist）：poly[i] *= ψ^{-i} mod q
+     * 当 use_fast_ntt_ = true 时执行完整 negacyclic INTT：
+     *   1. 标准 INTT（GS 蝶形 + 比特反转 + 归一化）
+     *   2. 后乘 ψ^{-i}（撤销 negacyclic twist）
      *
-     * GS 蝶形（单步）：
-     *   u = poly[k + j]
-     *   v = poly[k + j + half]
-     *   poly[k + j]        = u + v mod q
-     *   poly[k + j + half] = ω_ntt^{-j*step} * (u - v) mod q
+     * 当 use_fast_ntt_ = false 时仅执行标准 INTT（无后乘）。
      */
 
     uint32_t log = log2n();
@@ -384,11 +379,14 @@ void NTTContext<Params>::inverse(uint32_t* poly) const
     }
 
     // 后乘 ψ^{-i}（撤销 negacyclic twist）
-    // 正变换预乘了 ψ^i，逆变换需要乘以 ψ^{-i} 来恢复原始系数
-    uint32_t psi_inv_pow = 1;  // ψ^{-0} = 1
-    for (uint32_t i = 0; i < n_; ++i) {
-        poly[i] = mod_mul(poly[i], psi_inv_pow, q_);
-        psi_inv_pow = mod_mul(psi_inv_pow, psi_inv_, q_);
+    // 仅在 ψ 存在时执行（即 use_fast_ntt_ = true，如 Dilithium）
+    // 对于 Kyber，ψ 不存在于 Z_q 中，跳过此步骤
+    if (use_fast_ntt_) {
+        uint32_t psi_inv_pow = 1;  // ψ^{-0} = 1
+        for (uint32_t i = 0; i < n_; ++i) {
+            poly[i] = mod_mul(poly[i], psi_inv_pow, q_);
+            psi_inv_pow = mod_mul(psi_inv_pow, psi_inv_, q_);
+        }
     }
 }
 
@@ -418,24 +416,23 @@ void NTTContext<Params>::poly_mul(const uint32_t* a, const uint32_t* b,
                                    uint32_t* c) const
 {
     /**
-     * 完整的多项式乘法流程（使用 NTT 加速）
+     * 完整的多项式乘法流程: c = a * b in Z_q[x]/(x^n+1)
      *
-     * 步骤：
-     *   1. 复制输入（避免修改原始数据）
-     *   2. a_ntt = NTT(a)     —— 正向变换
-     *   3. b_ntt = NTT(b)     —— 正向变换
-     *   4. c_ntt = a_ntt ⊙ b_ntt  —— 逐点相乘
-     *   5. c = INTT(c_ntt)    —— 逆向变换
+     * 当 use_fast_ntt_ = true（如 Dilithium）时：
+     *   使用 NTT 加速的 negacyclic 卷积，复杂度 O(n log n)
      *
-     * 总复杂度: 2 * O(n log n) + O(n) = O(n log n)
-     * 对比朴素乘法: O(n^2)
-     *
-     * 对于 Kyber 参数 (n=256):
-     *   NTT 加速比 ≈ n / (2 log n) ≈ 256 / 16 = 16 倍
-     *
-     * 对于 Dilithium 参数 (n=256, 但 q 更大):
-     *   加速比类似，但模运算开销更大
+     * 当 use_fast_ntt_ = false（如 Kyber）时：
+     *   回退到 O(n²) 朴素乘法。Kyber 的 q=3329 满足 q-1 = 13×2^8，
+     *   2n = 512 = 2^9 不整除 q-1，因此 Z_q* 中不存在 2n 次单位根 ψ，
+     *   无法使用预乘/后乘方法的 negacyclic NTT。
+     *   （Kyber 实际使用"不完全分裂 NTT"，本演示工程后续可扩展实现。）
      */
+
+    if (!use_fast_ntt_) {
+        // Kyber 情况：回退到朴素乘法
+        naive_poly_mul(a, b, c, n_, q_);
+        return;
+    }
 
     // 分配临时数组
     std::vector<uint32_t> a_ntt(n_);
@@ -464,14 +461,15 @@ template <typename Params>
 bool verify_params()
 {
     /**
-     * 验证 NTT 参数的正确性（Negacyclic NTT 版本）
+     * 验证 NTT 参数的正确性
      *
      * 检查项：
      *   1. n 是否为 2 的幂
      *   2. q 是否为素数（简单试除法）
-     *   3. 从 omega 推导 ψ（2n 次本原单位根），验证 ψ^n ≡ -1 (mod q)
-     *      - omega^n ≡ -1: ψ = omega（Dilithium 情况）
-     *      - omega^n ≡ 1:  ψ = sqrt(omega)（Kyber 情况）
+     *   3. omega 是否为本原单位根
+     *      - omega^n ≡ -1: 2n 次单位根（Dilithium，快速 NTT 可用）
+     *      - omega^n ≡ 1 且 omega^{n/2} ≡ -1: n 次单位根（Kyber）
+     *        若 2n 不整除 q-1，则 ψ 不存在但参数仍然正确
      */
     constexpr uint32_t q = Params::q;
     constexpr uint32_t n = Params::n;
@@ -495,7 +493,7 @@ bool verify_params()
         }
     }
 
-    // 推导 ψ 并验证 ψ^n ≡ -1 (mod q)
+    // 推导 ψ 并验证
     uint32_t psi;
     uint32_t omega_n = mod_pow(omega, n, q);
 
@@ -503,7 +501,22 @@ bool verify_params()
         // omega 本身是 2n 次单位根（Dilithium 情况）
         psi = omega;
     } else if (omega_n == 1) {
-        // omega 是 n 次单位根，需计算 ψ = sqrt(omega)（Kyber 情况）
+        // omega 是 n 次单位根（Kyber 情况）
+        // 检查 omega^{n/2} ≡ -1 (mod q)，确认 omega 是本原 n 次单位根
+        uint32_t omega_half = mod_pow(omega, n / 2, q);
+        if (omega_half != q - 1) {
+            std::cerr << "错误: omega^{n/2} = " << omega_half
+                      << " != -1 (mod " << q << ")，omega 不是本原 " << n << " 次单位根\n";
+            return false;
+        }
+        // 检查 Z_q* 中是否存在 2n 次单位根 ψ
+        // q-1 必须被 2n 整除才能存在 ψ
+        if ((q - 1) % (2 * n) != 0) {
+            // ψ 不存在（Kyber 情况），但参数本身是正确的
+            // Kyber 使用"不完全分裂 NTT"，不需要全局 ψ
+            return true;
+        }
+        // ψ 存在，计算并验证
         psi = mod_sqrt(omega, q);
         if (psi == 0) {
             std::cerr << "错误: sqrt(" << omega << ") 在 Z_" << q << " 中不存在\n";

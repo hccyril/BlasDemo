@@ -22,8 +22,14 @@
  *   Z_q[x]/(x^n + 1) 上的 negacyclic 卷积（多项式乘法）。
  *
  * 本实现支持两组参数：
- *   1. Kyber 参数:     q = 3329,     n = 256, omega = 17   (n 次单位根，需计算 ψ = √17)
- *   2. Dilithium 参数: q = 8380417,  n = 256, omega = 1753 (2n 次单位根，ψ = omega)
+ *   1. Kyber 参数:     q = 3329,     n = 256, omega = 17   (n 次单位根)
+ *   2. Dilithium 参数: q = 8380417,  n = 256, omega = 1753 (2n 次单位根)
+ *
+ * 注意：Kyber 的 q-1 = 3328 = 13×2^8，而 2n = 512 = 2^9 不整除 q-1，
+ * 因此 Z_q* 中不存在 2n 次单位根 ψ（ψ^n = -1）。预乘/后乘方法不可用。
+ * Kyber 实际使用"不完全分裂 NTT"（7 层蝶形 + 二次域 basemul），
+ * 本演示工程对 Kyber 的 poly_mul 回退到 O(n²) 朴素乘法以保证正确性。
+ * Dilithium 的 q-1 = 8380416 = 2^23×3×7，2n | q-1，可使用完整快速 NTT。
  *
  * @note 本实现侧重教学演示，生产环境请使用高度优化的 NTT 库
  *       （如 libntt, PALISADE/OpenFHE 内置 NTT 等）
@@ -190,12 +196,12 @@ template <typename Params>
 class NTTContext {
 public:
     /**
-     * @brief 构造 NTT 上下文，预计算 negacyclic NTT 所需的全部参数
+     * @brief 构造 NTT 上下文，预计算 NTT 所需的全部参数
      *
      * 预计算内容：
-     *   1. ψ (psi): 2n 次本原单位根（从 omega 推导）
-     *      - 若 omega^n ≡ -1 (mod q): ψ = omega（Dilithium 情况）
-     *      - 若 omega^n ≡ 1 (mod q):  ψ = sqrt(omega)（Kyber 情况，需 Tonelli-Shanks）
+     *   1. ψ (psi): 2n 次本原单位根（仅当存在时）
+     *      - 若 omega^n ≡ -1 (mod q): ψ = omega（Dilithium，快速 NTT 可用）
+     *      - 若 omega^n ≡ 1 且 2n 不整除 q-1: ψ 不存在（Kyber，回退朴素乘法）
      *   2. ω_ntt = ψ^2: 标准 NTT 使用的 n 次单位根
      *   3. 正变换旋转因子: ω_ntt^i mod q
      *   4. 逆变换旋转因子: ω_ntt^{-i} mod q
@@ -204,29 +210,24 @@ public:
     NTTContext();
 
     /**
-     * @brief Negacyclic NTT 正变换（Cooley-Tukey 蝶形 + 预乘 ψ）
+     * @brief NTT 正向变换（Cooley-Tukey 蝶形）
      *
-     * 将多项式从系数表示转换为 negacyclic NTT 域。
-     * 在 NTT 域中，逐点相乘对应 Z_q[x]/(x^n+1) 上的多项式乘法。
-     *
-     * 步骤：
+     * 当 use_fast_ntt_ = true（如 Dilithium）时执行完整 negacyclic NTT：
      *   1. 预乘: poly[i] = poly[i] * ψ^i mod q（negacyclic twist）
      *   2. 标准 NTT: 比特反转 + Cooley-Tukey 蝶形（使用 ω_ntt = ψ^2）
      *
-     * @param poly  输入/输出多项式系数（原地变换），长度 = n
+     * 当 use_fast_ntt_ = false（如 Kyber）时仅执行标准 NTT（无预乘）。
      */
     void forward(uint32_t* poly) const;
 
     /**
-     * @brief Negacyclic NTT 逆变换（Gentleman-Sande 蝶形 + 后乘 ψ^{-1}）
+     * @brief NTT 逆变换（Gentleman-Sande 蝶形）
      *
-     * 将 negacyclic NTT 域恢复为系数表示。
-     *
-     * 步骤：
-     *   1. 标准 INTT: Gentleman-Sande 蝶形 + 比特反转 + 归一化（使用 ω_ntt^{-1}）
+     * 当 use_fast_ntt_ = true（如 Dilithium）时执行完整 negacyclic INTT：
+     *   1. 标准 INTT: GS 蝶形 + 比特反转 + 归一化（使用 ω_ntt^{-1}）
      *   2. 后乘: poly[i] = poly[i] * ψ^{-i} mod q（撤销 negacyclic twist）
      *
-     * @param poly  输入/输出多项式系数（原地变换），长度 = n
+     * 当 use_fast_ntt_ = false（如 Kyber）时仅执行标准 INTT（无后乘）。
      */
     void inverse(uint32_t* poly) const;
 
@@ -279,6 +280,7 @@ private:
     uint32_t omega_ntt_;                // NTT 使用的 n 次单位根（= ψ^2）
     uint32_t omega_ntt_inv_;            // ω_ntt 的模逆元
     uint32_t n_inv_;                    // n 的模逆元（用于 INTT 归一化）
+    bool use_fast_ntt_;                 // 是否可使用快速 NTT（需要 ψ 存在）
     std::vector<uint32_t> twiddles_;    // 正变换旋转因子: ω_ntt^i
     std::vector<uint32_t> inv_twiddles_;// 逆变换旋转因子: ω_ntt^{-i}
 
@@ -313,9 +315,9 @@ private:
  * 检查：
  *   1. q 是否为素数（简单的试除法）
  *   2. n 是否为 2 的幂
- *   3. 从 omega 推导 ψ（2n 次本原单位根），验证 ψ^n ≡ -1 (mod q)
- *      - 若 omega^n ≡ -1: ψ = omega（omega 本身即为 2n 次单位根）
- *      - 若 omega^n ≡ 1:  ψ = sqrt(omega)（需通过 Tonelli-Shanks 计算）
+ *   3. omega 是否为本原单位根
+ *      - omega^n ≡ -1: 2n 次单位根（Dilithium，快速 NTT 可用）
+ *      - omega^n ≡ 1 且 omega^{n/2} ≡ -1: n 次单位根（Kyber，回退朴素乘法）
  *
  * @tparam Params  参数结构体
  * @return true 表示参数正确，false 表示参数有误

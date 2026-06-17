@@ -76,3 +76,6 @@ Testing/
 *.swo
 *~
 
+# my
+prompt/
+.claude/

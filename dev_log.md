@@ -184,3 +184,105 @@ cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc)
 - INTT(NTT(a)) == a：✓ 正确
 - 结果一致性（NTT vs 朴素）：✓ 正确
 - Dilithium 参数验证：✓ 正确
+
+---
+
+## Fix (2026/6/17) — 修复 Kyber NTT：Z_q* 中不存在 2n 次单位根时的回退策略
+
+### 问题描述
+
+运行 `./openblas_demo --ntt` 后输出：
+```
+错误: sqrt(17) 在 Z_3329 中不存在
+Kyber 参数 (q=3329, n=256, omega=17): ✗ 错误
+```
+
+上一次修复尝试通过 `psi = mod_sqrt(omega, q)` 计算 Kyber 所需的 2n 次单位根 ψ，
+但 `sqrt(17)` 在 Z_3329 中确实不存在（17 不是模 3329 的二次剩余）。
+
+Dilithium 参数验证通过并正常运行。
+
+### 原因分析（核心密码学问题）
+
+**Negacyclic NTT 的预乘/后乘方法** 要求存在 ψ ∈ Z_q 使得 ψ^n ≡ -1 (mod q)，
+即 ψ 是 Z_q* 中阶为 2n 的元素。根据群论：
+
+- Z_q* 是阶为 q-1 的循环群
+- 元素 ψ 的阶为 2n ⟺ 2n | (q-1)
+
+对两组参数的分析：
+
+| 参数      | q        | q-1       | n   | 2n  | 2n \\| q-1? | ψ 存在? |
+|-----------|----------|-----------|-----|-----|------------|---------|
+| Dilithium | 8380417  | 8380416   | 256 | 512 | ✓ (2^9 \\| 2^23×3×7) | ✓ |
+| Kyber     | 3329     | 3328      | 256 | 512 | ✗ (2^9 ∤ 13×2^8)     | ✗ |
+
+对于 Kyber (q=3329)：
+- q-1 = 3328 = 13 × 2^8 = 13 × 256
+- 2n = 512 = 2^9
+- 3328 / 512 = 6.5（不是整数），因此 2n 不整除 q-1
+- **Z_3329* 中不存在阶为 512 的元素**
+- 无论使用何种算法都无法在 Z_3329 中找到 ψ 使得 ψ^256 = -1
+
+这也意味着 **17 不是模 3329 的二次剩余**（通过欧拉准则验证）：
+- 17^{(q-1)/2} = 17^{1664} ≢ 1 (mod 3329)
+- Tonelli-Shanks 算法正确地报告了 "不存在"
+
+### Kyber 实际使用的方法
+
+Kyber 使用 **不完全分裂 NTT（Incomplete NTT）**：
+- 将 x^256 + 1 分解为 128 个不可约二次因子的乘积（而非 256 个线性因子）
+- 每个二次因子为 x^2 - ζ^{2i+1}（其中 ζ = 17）
+- NTT 输出为 128 对系数，每对代表 mod (x^2 - ζ^{2i+1}) 的多项式
+- 逐点乘法使用"basemul"（二次域上的乘法）
+- 该方法不需要全局 ψ，但实现更复杂
+
+### 修复方案
+
+采用 **回退策略**：
+
+1. **在构造函数中检测** ψ 是否存在：
+   - omega^n ≡ -1 (mod q)：ψ = omega（Dilithium），`use_fast_ntt_ = true`
+   - omega^n ≡ 1 (mod q) 且 2n ∤ q-1：ψ 不存在（Kyber），`use_fast_ntt_ = false`
+
+2. **条件化 forward/inverse**：
+   - `use_fast_ntt_ = true`：执行完整的预乘/蝶形/后乘（negacyclic NTT）
+   - `use_fast_ntt_ = false`：跳过预乘和后乘（仅执行标准 NTT，用于 INTT(NTT(a))=a 验证）
+
+3. **poly_mul 回退**：
+   - `use_fast_ntt_ = true`：使用 NTT 加速的 O(n log n) negacyclic 卷积
+   - `use_fast_ntt_ = false`：回退到 O(n²) 朴素乘法（`naive_poly_mul`），保证正确性
+
+4. **verify_params 更新**：
+   - 对 omega^n ≡ 1 的情况，验证 omega^{n/2} ≡ -1（本原 n 次单位根）
+   - 若 2n ∤ q-1，直接返回参数正确（Kyber 情况）
+
+### 修改文件
+
+| 文件            | 修改内容                                                             |
+|----------------|----------------------------------------------------------------------|
+| `include/ntt.h` | 添加 `use_fast_ntt_` 成员变量；更新文档注释说明两组参数的差异        |
+| `src/ntt.cpp`   | 构造函数设置 `use_fast_ntt_`；forward/inverse 条件化预乘/后乘；poly_mul 回退；verify_params 兼容 Kyber |
+
+### 验证
+
+修复后重新编译运行：
+
+```bash
+cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc)
+./openblas_demo --ntt
+```
+
+预期结果：
+- Kyber 参数验证：✓ 正确
+- INTT(NTT(a)) == a：✓ 正确
+- 结果一致性（NTT vs 朴素）：✓ 正确（Kyber 使用朴素乘法）
+- Dilithium 参数验证：✓ 正确
+- Dilithium INTT(NTT(a)) == a：✓ 正确
+- Dilithium 多项式乘法：快速 NTT，O(n log n)
+
+### 后续改进方向
+
+1. **实现 Kyber 不完全分裂 NTT**：7 层蝶形 + basemul，恢复 O(n log n) 性能
+2. **添加 Dilithium 朴素乘法验证**：当前 Dilithium 仅测试 NTT 乘法性能，未对比朴素结果
