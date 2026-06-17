@@ -240,6 +240,30 @@ void symm(const double* A, const double* B, double* C,
           bool upper = true,
           double alpha = 1.0, double beta = 0.0);
 
+// ==========================================================================
+// 朴素实现（不使用 BLAS，用于性能对比）
+// ==========================================================================
+
+/**
+ * @brief 朴素矩阵乘法: C = A * B（不使用 BLAS，三层循环实现）
+ *
+ * 用于与 cblas_dgemm 进行性能对比，展示 OpenBLAS 优化带来的加速效果。
+ * 矩阵采用列优先存储，与 BLAS 接口一致。
+ *
+ * @param A    左矩阵（m x k，列优先）
+ * @param B    右矩阵（k x n，列优先）
+ * @param C    输出矩阵（m x n，列优先）
+ * @param m    A 的行数 / C 的行数
+ * @param n    B 的列数 / C 的列数
+ * @param k    A 的列数 / B 的行数
+ * @param lda  A 的主维度
+ * @param ldb  B 的主维度
+ * @param ldc  C 的主维度
+ */
+void naive_gemm(const double* A, const double* B, double* C,
+                size_t m, size_t n, size_t k,
+                size_t lda, size_t ldb, size_t ldc);
+
 } // namespace blas_demo
 
 #endif // BLAS_DEMO_H

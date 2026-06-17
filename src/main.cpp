@@ -32,6 +32,7 @@ extern "C" {
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
+#include <cmath>
 #include <string>
 
 // ==========================================================================
@@ -201,39 +202,66 @@ void demo_blas_level3()
 
 void benchmark_gemm()
 {
-    print_separator("性能基准测试: DGEMM 矩阵乘法");
+    print_separator("性能基准测试: DGEMM 矩阵乘法（OpenBLAS vs 朴素实现）");
 
     // 测试不同规模的矩阵
     std::vector<size_t> sizes = {128, 256, 512, 1024, 2048};
 
     std::cout << std::fixed << std::setprecision(2);
-    std::cout << "矩阵规模      | 耗时 (ms)  | GFLOPS\n";
-    std::cout << std::string(50, '-') << "\n";
+    std::cout << "矩阵规模      | OpenBLAS (ms) | 朴素实现 (ms) | 加速比  | 一致\n";
+    std::cout << std::string(72, '-') << "\n";
 
     for (size_t n : sizes) {
-        std::vector<double> A(n * n), B(n * n), C(n * n);
+        std::vector<double> A(n * n), B(n * n), C_blas(n * n), C_naive(n * n);
         blas_demo::random_matrix(A.data(), n, n);
         blas_demo::random_matrix(B.data(), n, n);
 
+        // === OpenBLAS GEMM ===
         // 预热（第一次调用可能有内存分配开销）
-        blas_demo::gemm(A.data(), B.data(), C.data(), n, n, n, n, n, n);
+        blas_demo::gemm(A.data(), B.data(), C_blas.data(), n, n, n, n, n, n);
 
-        // 计时：多次运行取平均
         const int repeat = (n <= 512) ? 10 : 3;
         Timer timer;
         timer.start();
         for (int i = 0; i < repeat; ++i) {
-            blas_demo::gemm(A.data(), B.data(), C.data(), n, n, n, n, n, n);
+            blas_demo::gemm(A.data(), B.data(), C_blas.data(), n, n, n, n, n, n);
         }
-        double elapsed = timer.elapsed_ms() / repeat;
+        double blas_time = timer.elapsed_ms() / repeat;
 
-        // 计算 GFLOPS: GEMM 的浮点运算次数 = 2 * m * n * k
-        double flops = 2.0 * n * n * n;
-        double gflops = flops / (elapsed * 1e6);  // ms -> GFLOPS
+        // === 朴素 GEMM ===
+        // 预热
+        blas_demo::naive_gemm(A.data(), B.data(), C_naive.data(), n, n, n, n, n, n);
+
+        // 小规模矩阵多跑几次取平均，大规模只跑一次
+        const int naive_repeat = (n <= 256) ? 3 : 1;
+        timer.start();
+        for (int i = 0; i < naive_repeat; ++i) {
+            blas_demo::naive_gemm(A.data(), B.data(), C_naive.data(), n, n, n, n, n, n);
+        }
+        double naive_time = timer.elapsed_ms() / naive_repeat;
+
+        // 计算加速比
+        double speedup = (blas_time > 0.001) ? naive_time / blas_time : 0.0;
+
+        // 比较两种实现的结果是否一致
+        // 浮点运算的累加顺序不同会导致微小差异，使用相对容差判断
+        bool match = true;
+        const double eps = 1e-8;  // 相对容差
+        for (size_t idx = 0; idx < n * n; ++idx) {
+            double diff = std::abs(C_blas[idx] - C_naive[idx]);
+            double scale = std::max({std::abs(C_blas[idx]), std::abs(C_naive[idx]), 1.0});
+            if (diff / scale > eps) {
+                match = false;
+                break;
+            }
+        }
 
         std::cout << std::setw(6) << n << " x " << std::setw(4) << n
-                  << "  |  " << std::setw(8) << elapsed << "  |  "
-                  << std::setw(6) << gflops << "\n";
+                  << "  |  " << std::setw(11) << blas_time
+                  << "  |  " << std::setw(11) << naive_time
+                  << "  |  " << std::setw(5) << std::setprecision(1) << speedup << "x"
+                  << "  |  " << (match ? "YES" : "NO") << "\n";
+        std::cout << std::setprecision(2);  // 恢复精度
     }
     std::cout << "\n";
 }

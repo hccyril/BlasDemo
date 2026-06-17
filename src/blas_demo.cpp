@@ -312,4 +312,44 @@ void symm(const double* A, const double* B, double* C,
     );
 }
 
+// ==========================================================================
+// 朴素实现（不使用 BLAS，用于性能对比）
+// ==========================================================================
+
+void naive_gemm(const double* A, const double* B, double* C,
+                size_t m, size_t n, size_t k,
+                size_t lda, size_t ldb, size_t ldc)
+{
+    /**
+     * 朴素矩阵乘法：三层循环实现 C = A * B
+     *
+     * 列优先存储下，元素 (i, j) 位于 data[j * ld + i]。
+     * 循环顺序 j-p-i：内层循环沿 i（行方向）遍历，
+     * 对列优先存储而言 C 和 A 的访问均为 stride-1，缓存局部性尚可。
+     *
+     * 但与 OpenBLAS 相比，缺少以下关键优化：
+     *   - 分块（Blocking/Tiling）：将矩阵切分为 L1/L2 缓存友好的子块
+     *   - SIMD 向量化：使用 AVX2/FMA 指令一次处理多个 double
+     *   - 多线程并行：将大矩阵切分为子任务分配给各 CPU 核心
+     *   - 汇编级微内核（Micro-kernel）：寄存器级别的极致优化
+     *   - 内存打包（Packing）：按访问顺序重排数据以提高缓存命中率
+     */
+    // 先将 C 清零
+    for (size_t j = 0; j < n; ++j) {
+        for (size_t i = 0; i < m; ++i) {
+            C[j * ldc + i] = 0.0;
+        }
+    }
+
+    // 三层循环：C[i][j] += A[i][p] * B[p][j]
+    for (size_t j = 0; j < n; ++j) {
+        for (size_t p = 0; p < k; ++p) {
+            double b_pj = B[j * ldb + p];
+            for (size_t i = 0; i < m; ++i) {
+                C[j * ldc + i] += A[p * lda + i] * b_pj;
+            }
+        }
+    }
+}
+
 } // namespace blas_demo
