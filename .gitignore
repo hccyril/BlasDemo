@@ -22,7 +22,7 @@
 *.dylib
 *.dll
 *.so.*
-
+openblas_demo
 
 # Fortran module files
 *.mod
@@ -43,6 +43,7 @@
 build/
 Build/
 build-*/
+cmake-build-*/
 
 # CMake generated files
 CMakeFiles/
@@ -67,3 +68,11 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.swo
+*~
+
