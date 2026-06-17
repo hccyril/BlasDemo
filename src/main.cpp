@@ -33,6 +33,7 @@ extern "C" {
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
+#include <algorithm>
 #include <string>
 
 // ==========================================================================
